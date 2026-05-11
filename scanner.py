@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import requests
 import socket
 import time
@@ -39,8 +40,29 @@ SYMBOL_SL_FLOORS = {
 DEFAULT_SL_FLOOR = 0.003
 
 # ── Hyperliquid info endpoint ─────────────────────────────────────────────────
-# Set HL_USE_MAINNET=true (env var) or flip this line to switch to production.
-HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
+# Set HL_USE_MAINNET=true (env var) to switch to production mainnet.
+# On mainnet all 8 coins are available.  On testnet LINK/XRP are missing and
+# ZEC exists in the universe but has ZERO trading activity (no candles, empty book).
+_USE_MAINNET = os.environ.get("HL_USE_MAINNET", "false").lower() in ("1", "true", "yes")
+HL_INFO_URL  = (
+    "https://api.hyperliquid.xyz/info"
+    if _USE_MAINNET else
+    "https://api.hyperliquid-testnet.xyz/info"
+)
+
+# ── Debug logging ─────────────────────────────────────────────────────────────
+# Set HL_DEBUG_API=true to print raw API request/response for HL_DEBUG_COIN.
+# Use HL_DEBUG_COIN=ETH to debug a different symbol.  Default coin is BTC.
+_DEBUG_API  = os.environ.get("HL_DEBUG_API", "false").lower() in ("1", "true", "yes")
+_DEBUG_COIN = os.environ.get("HL_DEBUG_COIN", "BTC").upper()
+
+def _debug_log(label, payload, response):
+    """Print raw API request and first 400 chars of response for the debug coin."""
+    print(f"\n[DEBUG-API] {label}")
+    print(f"  REQUEST : {json.dumps(payload)}")
+    resp_str = json.dumps(response) if not isinstance(response, str) else response
+    print(f"  RESPONSE: {resp_str[:600]}{'…' if len(resp_str) > 600 else ''}")
+    print()
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -71,8 +93,11 @@ _INTERVAL_MINUTES = {
 }
 
 
-def _hl_post(payload, max_retries=3):
-    """POST JSON payload to the Hyperliquid info endpoint with automatic retry."""
+def _hl_post(payload, max_retries=3, _debug_coin=None):
+    """POST JSON payload to the Hyperliquid info endpoint with automatic retry.
+
+    _debug_coin: if provided and HL_DEBUG_API=true, logs raw request + response.
+    """
     body = json.dumps(payload).encode()
     for attempt in range(max_retries):
         try:
@@ -83,7 +108,10 @@ def _hl_post(payload, max_retries=3):
                 timeout=8,
             )
             r.raise_for_status()
-            return r.json()
+            result = r.json()
+            if _debug_api and _debug_coin:
+                _debug_log(f"{_debug_coin} → {payload.get('type', '?')}", payload, result)
+            return result
         except Exception as exc:
             if attempt < max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
@@ -91,6 +119,10 @@ def _hl_post(payload, max_retries=3):
                 raise ValueError(
                     f"HL info POST failed after {max_retries} retries: {exc}"
                 ) from exc
+
+
+# Resolved once at import time so scanner_server can read it
+_debug_api = _DEBUG_API
 
 
 def fetch_klines(symbol, interval, limit=100):
@@ -110,10 +142,14 @@ def fetch_klines(symbol, interval, limit=100):
     hl_iv  = _HL_INTERVALS.get(interval, interval)
     mins   = _INTERVAL_MINUTES.get(hl_iv, 5)
     now_ms = int(time.time() * 1000)
-    # Request 5% extra to ensure we always get at least `limit` complete bars
-    start_ms = now_ms - int(limit * mins * 60 * 1000 * 1.05)
 
-    raw = _hl_post({
+    # Use 2× window — HL candleSnapshot does not guarantee dense bars for
+    # low-activity coins.  The extra headroom costs nothing (API filters by
+    # time) and avoids missing bars when trading is sporadic.
+    start_ms = now_ms - int(limit * mins * 60 * 1000 * 2.0)
+
+    is_debug = _DEBUG_API and symbol.upper() == _DEBUG_COIN
+    payload = {
         "type": "candleSnapshot",
         "req": {
             "coin":      symbol,
@@ -121,9 +157,20 @@ def fetch_klines(symbol, interval, limit=100):
             "startTime": start_ms,
             "endTime":   now_ms,
         },
-    })
+    }
+    raw = _hl_post(payload, _debug_coin=symbol if is_debug else None)
     if not isinstance(raw, list):
         raise ValueError(f"candleSnapshot unexpected response for {symbol}: {raw}")
+
+    # Always log debug info for the debug coin (even without full raw dump)
+    if is_debug:
+        print(f"[DEBUG] {symbol} candleSnapshot/{hl_iv}: {len(raw)} raw bars returned "
+              f"(window={start_ms} → {now_ms}, "
+              f"span={(now_ms - start_ms)/3_600_000:.1f}h)")
+        if raw:
+            first, last = raw[0], raw[-1]
+            print(f"  first bar: t={first.get('t')}  o={first.get('o')}  c={first.get('c')}  v={first.get('v')}")
+            print(f"  last  bar: t={last.get('t')}   o={last.get('o')}  c={last.get('c')}  v={last.get('v')}")
 
     candles = [
         {
@@ -137,7 +184,15 @@ def fetch_klines(symbol, interval, limit=100):
         for c in raw
     ]
     candles.sort(key=lambda x: x["time"])   # ensure ascending order
-    return candles[-limit:]                  # trim to requested limit
+    result = candles[-limit:]                # trim to requested limit
+
+    # Warn when a coin has too few candles for reliable indicator computation
+    if len(result) < 9:
+        net = "mainnet" if _USE_MAINNET else "testnet"
+        print(f"[WARN] {symbol} {hl_iv}: only {len(result)} candles on {net} "
+              f"(need ≥9 for KDJ).  "
+              f"Possible causes: coin not trading, newly listed, or very thin market.")
+    return result
 
 
 # Cache for metaAndAssetCtxs — reused across all symbols within the same scan cycle
@@ -164,6 +219,10 @@ def fetch_ticker(symbol):
 
     Returns a dict with keys used by the rest of scanner.py:
       lastPrice, riseFallRate, fundingRate, highPrice, lowPrice, amount24, vol24
+
+    HL assetCtx keys: funding, openInterest, prevDayPx, dayNtlVlm, premium,
+                      oraclePx, markPx, midPx, impactPxs, dayBaseVlm
+    All values arrive as strings — we explicitly cast each field to float.
     """
     meta, asset_ctxs = _fetch_meta()
     universe = meta.get("universe", [])
@@ -174,7 +233,12 @@ def fetch_ticker(symbol):
         None,
     )
     if idx is None or idx >= len(asset_ctxs):
-        raise ValueError(f"Coin {symbol!r} not found in Hyperliquid universe")
+        net = "mainnet" if _USE_MAINNET else "testnet"
+        raise ValueError(
+            f"Coin {symbol!r} not found in Hyperliquid {net} universe "
+            f"(universe has {len(universe)} coins).  "
+            f"Verify the coin name or set HL_USE_MAINNET=true."
+        )
 
     ctx      = asset_ctxs[idx]
     mark_px  = float(ctx.get("markPx")    or ctx.get("midPx") or 0)
@@ -188,13 +252,21 @@ def fetch_ticker(symbol):
     # riseFallRate: fractional 24h change — same sign/semantics as MEXC field
     rise_fall = (mark_px - prev_day) / prev_day if prev_day else 0.0
 
+    if _DEBUG_API and symbol.upper() == _DEBUG_COIN:
+        print(f"[DEBUG] {symbol} metaAndAssetCtxs idx={idx}")
+        print(f"  raw ctx  : {ctx}")
+        print(f"  parsed   : markPx={mark_px}  prevDayPx={prev_day}  "
+              f"funding={funding}  ntlVol={ntl_vol}  baseVol={base_vol}")
+        print(f"  derived  : riseFallRate={rise_fall:.6f} ({rise_fall*100:.3f}%)  "
+              f"highPrice={max(mark_px, oracle)}  lowPrice={min(mark_px, oracle)}")
+
     return {
         "lastPrice":    mark_px,
         "midPrice":     mid_px,
         "oraclePrice":  oracle,
         "riseFallRate": rise_fall,
         "fundingRate":  funding,
-        # highPrice / lowPrice not available in assetCtxs; use mark/oracle spread
+        # highPrice / lowPrice not in assetCtxs — approximate using mark/oracle spread
         "highPrice":    max(mark_px, oracle),
         "lowPrice":     min(mark_px, oracle),
         "amount24":     ntl_vol,
@@ -211,8 +283,14 @@ def fetch_depth(symbol, limit=20):
       {"bids": [[price, size], ...], "asks": [[price, size], ...]}
     Bids are sorted descending (best bid first).
     Asks are sorted ascending  (best ask first).
+
+    HL l2Book response format per level:
+      {"px": "price_str", "sz": "size_str", "n": num_orders}
+    Sizes are in base coin units (e.g. BTC amounts, not notional).
     """
-    raw = _hl_post({"type": "l2Book", "coin": symbol})
+    is_debug = _DEBUG_API and symbol.upper() == _DEBUG_COIN
+    payload  = {"type": "l2Book", "coin": symbol}
+    raw = _hl_post(payload, _debug_coin=symbol if is_debug else None)
     if not isinstance(raw, dict) or "levels" not in raw:
         raise ValueError(f"l2Book unexpected response for {symbol}: {raw}")
 
@@ -220,12 +298,32 @@ def fetch_depth(symbol, limit=20):
     raw_bids = levels[0] if len(levels) > 0 else []
     raw_asks = levels[1] if len(levels) > 1 else []
 
-    # HL format per level: {"px": "price_str", "sz": "size_str", "n": num_orders}
     bids = [[float(b["px"]), float(b["sz"])] for b in raw_bids[:limit]]
     asks = [[float(a["px"]), float(a["sz"])] for a in raw_asks[:limit]]
 
     bids.sort(key=lambda x: -x[0])   # descending — best bid first
     asks.sort(key=lambda x:  x[0])   # ascending  — best ask first
+
+    if is_debug or (not bids and not asks):
+        bid_vol = sum(b[1] for b in bids)
+        ask_vol = sum(a[1] for a in asks)
+        tot     = bid_vol + ask_vol
+        if not bids and not asks:
+            net = "mainnet" if _USE_MAINNET else "testnet"
+            print(f"[WARN] {symbol} l2Book: EMPTY order book on {net} — "
+                  f"bid_pct and ask_pct will be None (coin may not be trading).")
+        if is_debug:
+            print(f"[DEBUG] {symbol} l2Book: {len(bids)} bid levels, {len(asks)} ask levels")
+            if bids:
+                print(f"  best bid: px={bids[0][0]}  sz={bids[0][1]}")
+                print(f"  worst bid: px={bids[-1][0]}  sz={bids[-1][1]}")
+            if asks:
+                print(f"  best ask: px={asks[0][0]}  sz={asks[0][1]}")
+                print(f"  worst ask: px={asks[-1][0]}  sz={asks[-1][1]}")
+            if tot > 0:
+                print(f"  total vol: {tot:.6f}  B%={bid_vol/tot*100:.1f}%  S%={ask_vol/tot*100:.1f}%")
+            else:
+                print(f"  total vol: 0 (empty book — B%/S% will be None)")
 
     return {"bids": bids, "asks": asks}
 
@@ -776,16 +874,22 @@ def scan_symbol(symbol):
                 "ratio": round(max_ask / avg_ask, 1),
             }
 
+    ind5m_summary = _ind_summary(ind5m)
+    ind1h_summary = _ind_summary(ind1h)
+
+    bid_pct = round(bid_vol / total_vol * 100, 1) if total_vol > 0 else None
+    ask_pct = round(ask_vol / total_vol * 100, 1) if total_vol > 0 else None
+
     extra = {
-        "ind5m": _ind_summary(ind5m),
-        "ind1h": _ind_summary(ind1h),
+        "ind5m": ind5m_summary,
+        "ind1h": ind1h_summary,
         "k15": k15, "d15": d15, "j15": j15,
         "funding_rate": round(float(ticker.get("fundingRate", 0)) * 100, 6),
         "high_price": float(ticker.get("highPrice", price)),
         "low_price":  float(ticker.get("lowPrice",  price)),
         "volume_24":  float(ticker.get("amount24", ticker.get("vol24", 0))),
-        "bid_pct": round(bid_vol / total_vol * 100, 1) if total_vol > 0 else None,
-        "ask_pct": round(ask_vol / total_vol * 100, 1) if total_vol > 0 else None,
+        "bid_pct": bid_pct,
+        "ask_pct": ask_pct,
         "last_candle_5m": candles5m[-1] if candles5m else None,
         "bids_top": [[float(b[0]), float(b[1])] for b in bids[:10]],
         "asks_top": [[float(a[0]), float(a[1])] for a in asks[:10]],
@@ -795,6 +899,26 @@ def scan_symbol(symbol):
         "bid_vol_1p":  bid_vol_1p,  "ask_vol_1p":  ask_vol_1p,
         "bid_wall": bid_wall, "ask_wall": ask_wall,
     }
+
+    # ── Per-symbol scan summary log ────────────────────────────────────────────
+    j5_val  = ind5m_summary.get("j")
+    j1h_val = ind1h_summary.get("j")
+    net     = "mainnet" if _USE_MAINNET else "testnet"
+    print(
+        f"  [{net}] {symbol:<6}  price={price:<12.5g}  "
+        f"L:{long_score}/11  S:{short_score}/11  trend={trend:<12}  "
+        f"j5={f'{j5_val:.1f}' if j5_val is not None else 'None':<7}  "
+        f"j15={f'{j15:.1f}' if j15 is not None else 'None':<7}  "
+        f"j1h={f'{j1h_val:.1f}' if j1h_val is not None else 'None':<7}  "
+        f"B%={f'{bid_pct:.1f}' if bid_pct is not None else 'None':<6}  "
+        f"S%={f'{ask_pct:.1f}' if ask_pct is not None else 'None'}"
+    )
+    if j5_val is None:
+        print(f"  [INFO] {symbol}: j5=None — {len(candles5m)} 5m candles fetched "
+              f"(need ≥9 for KDJ).  KDJ column will show '—' on dashboard.")
+    if bid_pct is None:
+        print(f"  [INFO] {symbol}: bid_pct=None — empty order book "
+              f"({len(bids)} bids, {len(asks)} asks).  B%/S% columns will show '—' on dashboard.")
 
     return price, change_pct, long_score, short_score, long_details, short_details, candles5m, trend, j15, extra
 
