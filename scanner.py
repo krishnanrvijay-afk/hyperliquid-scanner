@@ -11,23 +11,24 @@ from datetime import datetime
 # operation in the process.
 socket.setdefaulttimeout(5)
 
-DEFAULT_SYMBOLS = ["ZEC_USDT", "SOL_USDT", "BTC_USDT", "ETH_USDT", "XRP_USDT",
-                   "DOGE_USDT", "LINK_USDT", "SUI_USDT"]
+DEFAULT_SYMBOLS = ["ZEC", "BTC", "ETH", "SOL", "XRP", "DOGE", "LINK", "SUI"]
 
 SYMBOL_SL_FLOORS = {
-    "ZEC_USDT":  0.005,
-    "DOGE_USDT": 0.005,
-    "SUI_USDT":  0.005,
-    "XRP_USDT":  0.005,   # raised 0.004 → 0.005 (floor was overriding structure)
-    "SOL_USDT":  0.003,
-    "LINK_USDT": 0.003,
-    "AAVE_USDT": 0.003,
-    "BTC_USDT":  0.003,
-    "ETH_USDT":  0.0015,  # lowered 0.002 → 0.0015 (tightest/most liquid, better R:R)
-    "BNB_USDT":  0.002,
+    "ZEC":  0.005,
+    "DOGE": 0.005,
+    "SUI":  0.005,
+    "XRP":  0.005,
+    "SOL":  0.003,
+    "LINK": 0.003,
+    "AAVE": 0.003,
+    "BTC":  0.003,
+    "ETH":  0.0015,
+    "BNB":  0.002,
 }
 DEFAULT_SL_FLOOR = 0.003
-BASE_URL = "https://contract.mexc.com"
+
+# ── Hyperliquid info endpoint (testnet) ───────────────────────────────────────
+HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -39,62 +40,182 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
-def _retry_get(url, params=None, max_retries=3):
-    """GET with automatic retry when MEXC returns a rate-limit response.
-    Back-off: 1.5 s → 3 s → 4.5 s before giving up."""
+# ── Interval mapping: MEXC-style or HL-style → canonical HL interval ──────────
+# Hyperliquid candleSnapshot accepted intervals:
+# "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w"
+_HL_INTERVALS = {
+    "Min1":  "1m",  "Min5":  "5m",  "Min15": "15m", "Min30": "30m",
+    "Min60": "1h",  "Hour4": "4h",  "Hour8": "8h",  "Day1":  "1d",
+    # Pass-through if already in HL format
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "8h":  "8h",
+    "12h": "12h", "1d": "1d", "3d": "3d", "1w":  "1w",
+}
+# Minutes per interval — used to compute startTime window from limit
+_INTERVAL_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "8h": 480,
+    "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080,
+}
+
+
+def _hl_post(payload, max_retries=3):
+    """POST JSON payload to the Hyperliquid info endpoint with automatic retry."""
+    body = json.dumps(payload).encode()
     for attempt in range(max_retries):
-        r = requests.get(url, params=params, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        if "too frequent" in (data.get("message") or "").lower():
-            time.sleep(1.5 * (attempt + 1))
-            continue
-        return data
-    raise ValueError(f"Rate-limited after {max_retries} retries: {url}")
+        try:
+            r = requests.post(
+                HL_INFO_URL,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                timeout=8,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                raise ValueError(
+                    f"HL info POST failed after {max_retries} retries: {exc}"
+                ) from exc
 
 
 def fetch_klines(symbol, interval, limit=100):
-    url = f"{BASE_URL}/api/v1/contract/kline/{symbol}"
-    params = {"interval": interval, "limit": limit}
-    data = _retry_get(url, params)
-    if not data.get("success"):
-        raise ValueError(f"Kline error for {symbol}: {data.get('message')}")
-    d = data["data"]
-    candles = []
-    times = d.get("time", [])
-    opens = d.get("open", [])
-    highs = d.get("high", [])
-    lows = d.get("low", [])
-    closes = d.get("close", [])
-    vols = d.get("vol", [])
-    for i in range(len(times)):
-        candles.append({
-            "time": times[i],
-            "open": float(opens[i]),
-            "high": float(highs[i]),
-            "low": float(lows[i]),
-            "close": float(closes[i]),
-            "vol": float(vols[i]),
-        })
-    return candles
+    """
+    Fetch OHLCV candles from Hyperliquid candleSnapshot.
+
+    Parameters
+    ----------
+    symbol   : bare coin name, e.g. "ETH"  (no _USDT suffix)
+    interval : MEXC-style ("Min5", "Min60") or HL-style ("5m", "1h") — both accepted
+    limit    : number of candles to return
+
+    Returns
+    -------
+    List of dicts: {time, open, high, low, close, vol}  (oldest first, ascending)
+    """
+    hl_iv  = _HL_INTERVALS.get(interval, interval)
+    mins   = _INTERVAL_MINUTES.get(hl_iv, 5)
+    now_ms = int(time.time() * 1000)
+    # Request 5% extra to ensure we always get at least `limit` complete bars
+    start_ms = now_ms - int(limit * mins * 60 * 1000 * 1.05)
+
+    raw = _hl_post({
+        "type": "candleSnapshot",
+        "req": {
+            "coin":      symbol,
+            "interval":  hl_iv,
+            "startTime": start_ms,
+            "endTime":   now_ms,
+        },
+    })
+    if not isinstance(raw, list):
+        raise ValueError(f"candleSnapshot unexpected response for {symbol}: {raw}")
+
+    candles = [
+        {
+            "time":  c.get("t", c.get("T", 0)),
+            "open":  float(c.get("o", 0)),
+            "high":  float(c.get("h", 0)),
+            "low":   float(c.get("l", 0)),
+            "close": float(c.get("c", 0)),
+            "vol":   float(c.get("v", 0)),
+        }
+        for c in raw
+    ]
+    candles.sort(key=lambda x: x["time"])   # ensure ascending order
+    return candles[-limit:]                  # trim to requested limit
+
+
+# Cache for metaAndAssetCtxs — reused across all symbols within the same scan cycle
+_meta_cache: dict = {"ts": 0.0, "data": None}
+_META_TTL_S = 10     # seconds before re-fetching
+
+
+def _fetch_meta():
+    """Return [meta, assetCtxs] from metaAndAssetCtxs, cached for _META_TTL_S seconds."""
+    now = time.time()
+    if _meta_cache["data"] and now - _meta_cache["ts"] < _META_TTL_S:
+        return _meta_cache["data"]
+    raw = _hl_post({"type": "metaAndAssetCtxs"})
+    if not isinstance(raw, list) or len(raw) < 2:
+        raise ValueError(f"metaAndAssetCtxs unexpected response: {raw}")
+    _meta_cache["ts"]   = now
+    _meta_cache["data"] = raw
+    return raw
 
 
 def fetch_ticker(symbol):
-    url = f"{BASE_URL}/api/v1/contract/ticker"
-    params = {"symbol": symbol}
-    data = _retry_get(url, params)
-    if not data.get("success"):
-        raise ValueError(f"Ticker error for {symbol}: {data.get('message')}")
-    return data["data"]
+    """
+    Fetch ticker data for a single coin via Hyperliquid metaAndAssetCtxs.
+
+    Returns a dict with keys used by the rest of scanner.py:
+      lastPrice, riseFallRate, fundingRate, highPrice, lowPrice, amount24, vol24
+    """
+    meta, asset_ctxs = _fetch_meta()
+    universe = meta.get("universe", [])
+
+    idx = next(
+        (i for i, a in enumerate(universe)
+         if a.get("name", "").upper() == symbol.upper()),
+        None,
+    )
+    if idx is None or idx >= len(asset_ctxs):
+        raise ValueError(f"Coin {symbol!r} not found in Hyperliquid universe")
+
+    ctx      = asset_ctxs[idx]
+    mark_px  = float(ctx.get("markPx")    or ctx.get("midPx") or 0)
+    mid_px   = float(ctx.get("midPx")     or mark_px)
+    prev_day = float(ctx.get("prevDayPx") or mark_px)
+    funding  = float(ctx.get("funding")   or 0)
+    ntl_vol  = float(ctx.get("dayNtlVlm") or 0)   # notional USDT volume
+    base_vol = float(ctx.get("dayBaseVlm") or 0)  # volume in coin units
+    oracle   = float(ctx.get("oraclePx")  or mark_px)
+
+    # riseFallRate: fractional 24h change — same sign/semantics as MEXC field
+    rise_fall = (mark_px - prev_day) / prev_day if prev_day else 0.0
+
+    return {
+        "lastPrice":    mark_px,
+        "midPrice":     mid_px,
+        "oraclePrice":  oracle,
+        "riseFallRate": rise_fall,
+        "fundingRate":  funding,
+        # highPrice / lowPrice not available in assetCtxs; use mark/oracle spread
+        "highPrice":    max(mark_px, oracle),
+        "lowPrice":     min(mark_px, oracle),
+        "amount24":     ntl_vol,
+        "vol24":        base_vol,
+        "_ctx":         ctx,
+    }
 
 
 def fetch_depth(symbol, limit=20):
-    url = f"{BASE_URL}/api/v1/contract/depth/{symbol}"
-    params = {"limit": limit}
-    data = _retry_get(url, params)
-    if not data.get("success"):
-        raise ValueError(f"Depth error for {symbol}: {data.get('message')}")
-    return data["data"]
+    """
+    Fetch order book from Hyperliquid l2Book.
+
+    Returns a dict compatible with the rest of scanner.py:
+      {"bids": [[price, size], ...], "asks": [[price, size], ...]}
+    Bids are sorted descending (best bid first).
+    Asks are sorted ascending  (best ask first).
+    """
+    raw = _hl_post({"type": "l2Book", "coin": symbol})
+    if not isinstance(raw, dict) or "levels" not in raw:
+        raise ValueError(f"l2Book unexpected response for {symbol}: {raw}")
+
+    levels   = raw["levels"]          # [[bid_levels], [ask_levels]]
+    raw_bids = levels[0] if len(levels) > 0 else []
+    raw_asks = levels[1] if len(levels) > 1 else []
+
+    # HL format per level: {"px": "price_str", "sz": "size_str", "n": num_orders}
+    bids = [[float(b["px"]), float(b["sz"])] for b in raw_bids[:limit]]
+    asks = [[float(a["px"]), float(a["sz"])] for a in raw_asks[:limit]]
+
+    bids.sort(key=lambda x: -x[0])   # descending — best bid first
+    asks.sort(key=lambda x:  x[0])   # ascending  — best ask first
+
+    return {"bids": bids, "asks": asks}
 
 
 def sma(values, n):
@@ -568,15 +689,15 @@ def print_alert_short(symbol, price, short_score, details, trade):
 
 
 def scan_symbol(symbol):
-    candles5m = fetch_klines(symbol, "Min5", 100)
-    candles1h = fetch_klines(symbol, "Min60", 100)
+    candles5m = fetch_klines(symbol, "5m", 100)
+    candles1h = fetch_klines(symbol, "1h", 100)
     ticker = fetch_ticker(symbol)
     depth = fetch_depth(symbol, 20)
 
     j15 = None
     k15 = d15 = None
     try:
-        candles15m = fetch_klines(symbol, "Min15", 50)
+        candles15m = fetch_klines(symbol, "15m", 50)
         k15, d15, j15 = kdj(candles15m)
     except Exception:
         pass
@@ -761,7 +882,7 @@ def review_alerts(log_path, symbol_filter=None, direction_filter=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="MEXC Futures Market Scanner",
+        description="Hyperliquid Futures Market Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -844,7 +965,7 @@ def main():
     interval = args.interval
     threshold = args.threshold
 
-    print(f"{CYAN}{BOLD}MEXC Futures Market Scanner Starting...{RESET}")
+    print(f"{CYAN}{BOLD}Hyperliquid Futures Market Scanner Starting...{RESET}")
     print(f"{DIM}Symbols: {', '.join(symbols)}{RESET}")
     print(f"{DIM}Polling every {interval}s | Alert threshold: {threshold}/10{RESET}")
     print(f"{DIM}Alert log: {log_path}{RESET}\n")
