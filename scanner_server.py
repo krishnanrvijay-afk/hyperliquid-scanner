@@ -181,6 +181,7 @@ def _sanitize_err(text: str) -> str:
 
 
 def _tg_post(text):
+    text = "🔷 HYPERLIQUID\n" + text
     # Last-resort guard: if raw HTML is still in the message, drop parse_mode
     # so Telegram receives it as plain text rather than rejecting it with 400.
     if _HTML_PAGE_RE.search(text):
