@@ -595,6 +595,7 @@ pending_alerts:         dict  = {}    # key: "SYMBOL_SIDE", value: datetime firs
 daily_loss_total:       float = 0.0   # LARGE mode: running daily loss (USDT)
 daily_loss_reset_date         = None  # date of last daily reset
 _daily_limit_notified:  bool  = False # True once limit-hit Telegram has been sent today
+_stale_notified:        set   = set() # keys "SYMBOL_DIRECTION_stale" — prevents duplicate stale Telegrams
 
 def _cooldown_remaining(key: str) -> float:
     """Return remaining cooldown seconds for the given key, or 0.0 if not in cooldown."""
@@ -833,6 +834,29 @@ def run_scanner():
                             "lev": lev_s, "sl_pct": slp_s, "liq": liq_s,
                         },
                     })
+                # ── Stale-zone check for last alert ───────────────────────
+                with _lock:
+                    _last_al = _state["symbols"][symbol].get("last_alert")
+                if _last_al is not None:
+                    _al_sl  = _last_al.get("stale_low")
+                    _al_sh  = _last_al.get("stale_high")
+                    _al_dir = _last_al.get("direction", "")
+                    _al_sym = _last_al.get("symbol", symbol)
+                    _snk    = f"{symbol}_{_al_dir}_stale"
+                    if _al_sl is not None and _al_sh is not None:
+                        if price < _al_sl or price > _al_sh:
+                            if _snk not in _stale_notified:
+                                _stale_notified.add(_snk)
+                                _stale_msg = (
+                                    f"⏰ STALE — {_al_sym} {_al_dir} — "
+                                    f"Price exited valid zone "
+                                    f"{_fmt_price(_al_sym, _al_sl)} — {_fmt_price(_al_sym, _al_sh)}. "
+                                    f"Cancel trigger order."
+                                )
+                                print(f"  [stale_notify] {_snk}: price={price} outside [{_al_sl},{_al_sh}]")
+                                threading.Thread(target=_tg_post, args=(_stale_msg,), daemon=True).start()
+                        else:
+                            _stale_notified.discard(_snk)   # price back in zone — re-arm
                 # ── LONG alert check ──────────────────────────────────────
                 long_block_reason = None
                 _lpk = f"{symbol}_LONG"
@@ -959,6 +983,7 @@ def run_scanner():
                         with _lock:
                             _state["alerts"].appendleft(alert)
                             _state["symbols"][symbol]["last_alert"] = alert
+                            _stale_notified.discard(f"{symbol}_LONG_stale")
                             if symbol in _pending_reminders:
                                 _pending_reminders[symbol].set()
                             cancel_event = threading.Event()
@@ -1096,6 +1121,7 @@ def run_scanner():
                         with _lock:
                             _state["alerts"].appendleft(alert)
                             _state["symbols"][symbol]["last_alert"] = alert
+                            _stale_notified.discard(f"{symbol}_SHORT_stale")
                             if symbol in _pending_reminders:
                                 _pending_reminders[symbol].set()
                             cancel_event = threading.Event()
