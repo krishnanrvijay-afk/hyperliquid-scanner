@@ -11,23 +11,35 @@ from datetime import datetime
 # operation in the process.
 socket.setdefaulttimeout(5)
 
-DEFAULT_SYMBOLS = ["ZEC", "BTC", "ETH", "SOL", "XRP", "DOGE", "LINK", "SUI"]
+# ── Coin names verified against Hyperliquid universe (POST {"type":"meta"}) ───
+# Mainnet indices: BTC=0  ETH=1  SOL=5  DOGE=12  SUI=14  LINK=18  XRP=25  ZEC=214
+# All 8 coins confirmed on mainnet with these exact names (plain uppercase, no suffix).
+# Testnet note: XRP and LINK are NOT in the testnet universe — scans for those two
+# symbols will raise a ValueError which scan_symbol catches per-symbol gracefully.
+DEFAULT_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "SUI", "LINK", "XRP", "ZEC"]
+
+# Coins available on TESTNET  (6 of 8):  BTC ETH SOL DOGE SUI ZEC
+# Coins mainnet-only           (2 of 8):  LINK XRP
+# Switch HL_INFO_URL to mainnet to scan all 8.
 
 SYMBOL_SL_FLOORS = {
-    "ZEC":  0.005,
-    "DOGE": 0.005,
-    "SUI":  0.005,
-    "XRP":  0.005,
-    "SOL":  0.003,
-    "LINK": 0.003,
-    "AAVE": 0.003,
+    # Tightest floors first (most liquid)
     "BTC":  0.003,
     "ETH":  0.0015,
+    "SOL":  0.003,
+    "DOGE": 0.005,
+    "SUI":  0.005,
+    "LINK": 0.003,
+    "XRP":  0.005,
+    "ZEC":  0.005,
+    # Additional coins (not in default watchlist but recognised if added)
+    "AAVE": 0.003,
     "BNB":  0.002,
 }
 DEFAULT_SL_FLOOR = 0.003
 
-# ── Hyperliquid info endpoint (testnet) ───────────────────────────────────────
+# ── Hyperliquid info endpoint ─────────────────────────────────────────────────
+# Set HL_USE_MAINNET=true (env var) or flip this line to switch to production.
 HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 GREEN = "\033[92m"
