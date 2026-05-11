@@ -21,7 +21,7 @@ from scanner import (
 from hyperliquid_api import place_order_from_alert, monitor_position
 
 ACCOUNT_MODE          = "SMALL"      # "SMALL" | "MEDIUM" | "LARGE" — change this one line
-API_TRADING_ENABLED   = os.environ.get("API_TRADING_ENABLED", "False").strip().lower() == "true"
+API_TRADING_ENABLED   = False
 CONSECUTIVE_LOSSES    = 0            # incremented on SL hit; reset on TP win; auto-pauses at 5
 _daily_trades: list   = []           # list of trade dicts for current calendar day (EST)
 _TRADE_STATE_FILE     = "trade_state.json"
