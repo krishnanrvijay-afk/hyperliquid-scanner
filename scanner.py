@@ -447,7 +447,16 @@ def classify_trend(klines_5m, klines_1h, current_price):
     return "Choppy"
 
 
-def score_long(price, ind5m, ind1h, ticker, depth, j15=None):
+def score_long(price, ind5m, ind1h, ticker, depth, j15=None, j5m_prev=None, symbol=""):
+    # ── Pre-score gates (run before any point is awarded) ────────────────────────
+    _, _, _j1h = ind1h["kdj"]
+    _, _, _j5  = ind5m["kdj"]
+    if _j1h is not None and _j1h > 40:
+        print(f"BOUNCE LONG BLOCKED {symbol} — J1H {_j1h:.1f} above 40 threshold — no confluence")
+        return 0, [f"[GATE] J1H CONFLUENCE FAILED — j1h {_j1h:.1f} above 40 — no multi-timeframe oversold confluence"]
+    if j5m_prev is not None and _j5 is not None and _j5 <= j5m_prev:
+        print(f"BOUNCE LONG BLOCKED {symbol} — J5M {_j5:.1f} not rising from prev {j5m_prev:.1f} — no directional confirmation")
+        return 0, [f"[GATE] J5M DIRECTION FAILED — j5m {_j5:.1f} not rising from prev {j5m_prev:.1f}"]
     score = 0
     details = []
 
@@ -572,7 +581,16 @@ def score_long(price, ind5m, ind1h, ticker, depth, j15=None):
     return score, details
 
 
-def score_short(price, ind5m, ind1h, ticker, depth, j15=None):
+def score_short(price, ind5m, ind1h, ticker, depth, j15=None, j5m_prev=None, symbol=""):
+    # ── Pre-score gates (run before any point is awarded) ────────────────────────
+    _, _, _j1h = ind1h["kdj"]
+    _, _, _j5  = ind5m["kdj"]
+    if _j1h is not None and _j1h < 60:
+        print(f"BOUNCE SHORT BLOCKED {symbol} — J1H {_j1h:.1f} below 60 threshold — no confluence")
+        return 0, [f"[GATE] J1H CONFLUENCE FAILED — j1h {_j1h:.1f} below 60 — no multi-timeframe overbought confluence"]
+    if j5m_prev is not None and _j5 is not None and _j5 >= j5m_prev:
+        print(f"BOUNCE SHORT BLOCKED {symbol} — J5M {_j5:.1f} not falling from prev {j5m_prev:.1f} — no directional confirmation")
+        return 0, [f"[GATE] J5M DIRECTION FAILED — j5m {_j5:.1f} not falling from prev {j5m_prev:.1f}"]
     score = 0
     details = []
 
@@ -798,7 +816,7 @@ def print_alert_short(symbol, price, short_score, details, trade):
     print()
 
 
-def scan_symbol(symbol):
+def scan_symbol(symbol, j5m_prev=None):
     candles5m = fetch_klines(symbol, "5m", 100)
     candles1h = fetch_klines(symbol, "1h", 100)
     ticker = fetch_ticker(symbol)
@@ -818,8 +836,8 @@ def scan_symbol(symbol):
     ind5m = calc_indicators(candles5m)
     ind1h = calc_indicators(candles1h)
 
-    long_score, long_details = score_long(price, ind5m, ind1h, ticker, depth, j15)
-    short_score, short_details = score_short(price, ind5m, ind1h, ticker, depth, j15)
+    long_score, long_details = score_long(price, ind5m, ind1h, ticker, depth, j15, j5m_prev=j5m_prev, symbol=symbol)
+    short_score, short_details = score_short(price, ind5m, ind1h, ticker, depth, j15, j5m_prev=j5m_prev, symbol=symbol)
 
     trend = classify_trend(candles5m, candles1h, price)
 

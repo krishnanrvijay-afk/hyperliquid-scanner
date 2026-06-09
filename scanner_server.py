@@ -694,10 +694,14 @@ _state = {
         "long_checklist": [], "short_checklist": [], "extra": None,
         "long_trade": None, "short_trade": None,
         "last_alert": None,
+        "scan_history": deque(maxlen=20),    # ring buffer: last 20 cycles, newest first
     } for s in SYMBOLS},
     "alerts": deque(maxlen=3),
     "balance_usdt": None,
 }
+
+# Per-symbol previous J5m cache — used by score_long/score_short for J5m directional gate
+_j5m_prev: dict = {s: None for s in SYMBOLS}
 
 # Updated atomically at the start of every scan cycle.
 # The watchdog thread uses this to detect a stale/dead scan loop.
@@ -792,7 +796,7 @@ def run_scanner():
             _price_pause.set()                 # stop price polling while scan fetches run
             _futs = {}
             for _i, _sym in enumerate(SYMBOLS):
-                _futs[_ex.submit(scan_symbol, _sym)] = _sym
+                _futs[_ex.submit(scan_symbol, _sym, _j5m_prev.get(_sym))] = _sym
                 if _i < len(SYMBOLS) - 1:
                     time.sleep(0.5)            # 0.5s stagger — gentle pacing, no burst
             try:
@@ -856,6 +860,23 @@ def run_scanner():
                             "lev": lev_s, "sl_pct": slp_s, "liq": liq_s,
                         },
                     })
+                    # ── Per-pair scan history ring buffer ─────────────────────────────
+                    _cur_j5m  = (extra.get("ind5m") or {}).get("j") if extra else None
+                    _cur_j1h  = (extra.get("ind1h") or {}).get("j") if extra else None
+                    _cur_j15  = extra.get("j15")  if extra else None
+                    _state["symbols"][symbol]["scan_history"].appendleft({
+                        "ts":          cycle_time,
+                        "j5m":         _cur_j5m,
+                        "j15m":        _cur_j15,
+                        "j1h":         _cur_j1h,
+                        "trend":       trend,
+                        "long_score":  ls,
+                        "short_score": ss,
+                        "bid_pct":     extra.get("bid_pct")  if extra else None,
+                        "ask_pct":     extra.get("ask_pct")  if extra else None,
+                        "price":       price,
+                    })
+                    _j5m_prev[symbol] = _cur_j5m
                 # ── LONG alert check ──────────────────────────────────────
                 long_block_reason = None
                 _lpk = f"{symbol}_LONG"
@@ -1243,6 +1264,7 @@ def get_detail_json(symbol):
         "short_trade":      d.get("short_trade"),
         "last_alert":       d.get("last_alert"),
         "next_scan_epoch":  next_scan_epoch,
+        "scan_history":     list(d.get("scan_history", [])),  # most recent first
     })
 
 
